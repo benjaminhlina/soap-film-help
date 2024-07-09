@@ -1,0 +1,204 @@
+---
+title: "Gam"
+author: "Jack B"
+date: "2024-06-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(mgcv)
+library(tidyverse)
+library(purrr)
+library(data.table)
+library(terra)
+library(sjPlot)
+require(sf)
+require(sp)
+require(raster)
+require(gdistance)
+require(rgeos)
+library(rmapshaper)
+library(gratia)
+library(viridis)
+library(spbabel)
+```
+
+Read in data frame if need to
+```{r}
+n_fish = fread(here::here("jack-help", "gam", "n_fish.csv"), header = TRUE) 
+```
+
+Filter relevant columns
+```{r}
+n_fish <- n_fish %>% 
+  dplyr::select(new_receiver_id, longitude, 
+                latitude, study_year, origin, 
+                year, week, new_season, month, max_fish, number_of_fish)
+
+n_fish$origin <- as.factor(n_fish$origin)
+```
+
+Filter data to just spring
+```{r}
+n_fish_spring <- n_fish %>% filter(new_season == 'spring')
+```
+
+Convert data frame to UTM
+```{r}
+#Convert to UTM
+n_fish_spring_utm <- n_fish_spring %>%
+  st_as_sf(., coords=c("longitude", "latitude"), crs=4326) %>% 
+  st_transform(32633) %>% 
+  as(., "Spatial") %>% 
+  as_tibble() %>% 
+  dplyr::rename(x=coords.x1, y=coords.x2)
+```
+
+
+1. Running GAM with tp sline with a bivriate spatial variable (runs fine)
+
+```{r}
+mod1 <- gam(number_of_fish ~ origin + s(x, y, by = origin, k = 40) + 
+              s(study_year, k = 3) + origin, offset = log(max_fish),
+            data = n_fish_spring_utm, 
+            family=nb(link = "log"),
+            method = "REML")
+```
+
+Model check
+```{r}
+# gam.check(mod1) #Not great, but going with this for now
+appraise(mod1)
+```
+
+Model output
+```{r}
+summary(mod1)
+```
+
+Plot model
+```{r}
+gratia::draw(mod1, contour = FALSE, scales = 'fixed', select = c(1,2))
+```
+
+2. Using a 'soap film smoother' to bound the GAM
+
+Creating soap film smoother
+```{r}
+shape <- st_read(here::here("jack-help", 
+                            "gam", 
+                            "shapefile_new", 
+                            "siljan_new.shp")) %>% 
+  st_transform(32633) %>% 
+  as(., "Spatial") %>% 
+  sp::geometry(.)
+plot(shape, col = "blue")
+```
+
+Simplify shape
+```{r}
+shape_simp <- ms_simplify(shape, keep = 0.01, keep_shapes = FALSE, explode = TRUE)
+plot(shape_simp, col = "blue")
+```
+
+Creat knots for soap film smoother
+```{r}
+shape.xy.aut <- sptable(shape_simp)
+
+shape.xy.aut <- shape.xy.aut %>%
+  dplyr::rename(x = x_, y = y_)
+
+#Make knots from the geographical extent of the observations
+N <- floor((abs((max(n_fish_spring_utm$x)-min(n_fish_spring_utm$x)))/1000)) #every 1000 m
+gx <- seq(min(n_fish_spring_utm$x), max(n_fish_spring_utm$x), length.out = N)
+gy <- seq(min(n_fish_spring_utm$y), max(n_fish_spring_utm$y), length.out = N)
+gp <- expand.grid(gx, gy)
+names(gp) <- c("x","y")
+plot(gp$x, gp$y)
+
+#The GAM needs the border coordinates as a list of lists,
+#where each list describes one border segment or island:
+coords <- shape.xy.aut %>% dplyr::select(x,y,branch_)
+names(coords) <- c("x", "y", "branch_")
+borderlist <- split(coords, coords$branch_)
+names(borderlist)
+
+border.aut <- lapply(borderlist, `[`, c(1,2))
+nr <- seq(1,3)
+border.aut <- lapply(nr, function(n) as.list.data.frame(border.aut[[n]]))
+
+#Make knots
+lake_grid <- st_as_sf(shape_simp) %>%
+  st_make_grid(cellsize = 1000, square = TRUE, what = "centers") %>%
+  st_as_sf() 
+
+st_geometry(lake_grid) <- "geometry"
+
+#remove knots that fall outside the boundry
+lake_intesects <- st_intersection(st_as_sf(shape_simp), lake_grid)
+
+lake_knots <- lake_intesects %>%
+  mutate(
+    lon = st_coordinates(.)[,"X"],
+    lat = st_coordinates(.)[,"Y"]
+  ) %>%
+  st_drop_geometry() %>%
+  as.data.frame() %>%
+  dplyr::select(lon, lat)
+
+#And then check that the border and knots are in order with the soap_check function
+#devtools::install_github("dill/soapcheckr")
+library(soapcheckr)
+
+#vignette("how_to_use_soapcheckr")
+
+lake_knots <- lake_knots %>% dplyr::mutate(x = lon,
+                                           y = lat) %>% dplyr::select(x,y)
+
+#check knots
+soap_check(border.aut, knots = lake_knots)
+```
+
+identify knots that fall outside boundry
+```{r}
+crunch_ind <- autocruncher(border.aut, lake_knots)
+crunch_ind
+# remove knots that are problematic
+lake_knots <- lake_knots[-crunch_ind, ]
+soap_check(border.aut, knots = lake_knots)
+```
+
+Gam with a soap film smoother
+```{r}
+mod2 <- gam(number_of_fish ~ s(x, y, by = origin, k = 40, bs = "so", xt = list(bnd = border.aut, nmax=1500)) + s(study_year, k = 3) + origin, offset=log(max_fish),
+            data = n_fish_spring_utm, 
+            family=nb(link = 'log'),
+            method = "REML", 
+            knots = lake_knots)
+```
+
+Model checks
+```{r}
+gam.check(mod2) #Not great
+```
+
+Model summary
+```{r}
+summary(mod2)
+```
+
+Plot model - does not work (Error in `mutate()`:ℹ In argument: `.loop = rep(seq_along(pts), each = pts)`.Caused by error:! `.loop` must be size 536 or 1, not 1446.)
+```{r}
+gratia::draw(mod2, contour = FALSE, scales = 'fixed', select = c(1,2))
+```
+
+Plot model
+```{r}
+plot(mod2)
+```
+
